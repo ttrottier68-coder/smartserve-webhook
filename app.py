@@ -1,6 +1,6 @@
 """
-SmartServe Webhook Receiver v2
-Adds: in-memory request log, /stats endpoint, raw request logging
+SmartServe Webhook Receiver v3
+Fixes: tool-calls event handling (Vapi sends 'tool-calls' not 'function-call')
 """
 
 import os
@@ -21,7 +21,6 @@ try:
 except ImportError:
     GSPREAD_AVAILABLE = False
 
-# ---------- Config ----------
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 GOOGLE_SHEET_TAB = os.environ.get("GOOGLE_SHEET_TAB", "Sheet1")
@@ -39,40 +38,40 @@ log = logging.getLogger("smartserve-webhook")
 
 app = Flask(__name__)
 
-# ---------- In-memory request log (last 50 requests) ----------
-request_log = deque(maxlen=50)
+request_log = deque(maxlen=100)
 
 
 def log_request(path, method, payload_summary, response_summary, duration_ms, status_code):
     entry = {
-        "time": now_iso(),
-        "path": path,
-        "method": method,
-        "payload": payload_summary,
-        "response": response_summary,
-        "duration_ms": duration_ms,
-        "status": status_code,
+        "time": now_iso(), "path": path, "method": method,
+        "payload": payload_summary, "response": response_summary,
+        "duration_ms": duration_ms, "status": status_code,
         "remote": request.remote_addr if request else "?"
     }
     request_log.append(entry)
-    log.info("REQ %s %s -> %d (%dms) | %s", method, path, status_code, duration_ms, payload_summary[:80])
 
 
-# ---------- Google Sheets ----------
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def truncate(s, n=5000):
+    if s is None: return ""
+    s = str(s)
+    return s if len(s) <= n else s[:n] + "..."
+
+
 _gsheet_client = None
 
 
 def get_gsheet_client():
     global _gsheet_client
-    if _gsheet_client is not None:
-        return _gsheet_client
+    if _gsheet_client is not None: return _gsheet_client
     if not GSPREAD_AVAILABLE or not GOOGLE_SHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
         return None
     try:
         creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        creds = Credentials.from_service_account_info(
-            creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
+        creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"])
         _gsheet_client = gspread.authorize(creds)
         return _gsheet_client
     except Exception as e:
@@ -82,8 +81,7 @@ def get_gsheet_client():
 
 def write_to_sheet(row):
     client = get_gsheet_client()
-    if not client:
-        return False
+    if not client: return False
     try:
         sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_TAB)
         sheet.append_row(row, value_input_option="USER_ENTERED")
@@ -93,7 +91,6 @@ def write_to_sheet(row):
         return False
 
 
-# ---------- Email ----------
 def send_email(subject, body):
     if not EMAIL_ENABLED or not all([EMAIL_FROM, EMAIL_TO, SMTP_USER, SMTP_PASS]):
         return False
@@ -113,22 +110,9 @@ def send_email(subject, body):
         return False
 
 
-# ---------- Helpers ----------
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def truncate(s, n=5000):
-    if s is None: return ""
-    s = str(s)
-    return s if len(s) <= n else s[:n] + "..."
-
-
 # ---------- Event handlers ----------
-def handle_vapi_function_call(payload):
-    fc = payload.get("message", {}).get("functionCall", {})
-    params = fc.get("parameters", {}) or {}
-    call = payload.get("message", {}).get("call", {}) or {}
+def save_lead_handler(params, call):
+    """Process save_lead tool call. Returns the result string."""
     name = params.get("name", "")
     phone = params.get("phone", "")
     email = params.get("email", "")
@@ -157,7 +141,6 @@ Phone: {phone}
 Email: {email or '(not provided)'}
 Business: {business or '(not provided)'}
 Type: {business_type or '(not provided)'}
-Call volume: {call_volume or '(not provided)'}
 Use case: {use_case or '(not provided)'}
 Urgency: {urgency or '(not provided)'}
 Callback time: {callback_time or '(not provided)'}
@@ -168,8 +151,38 @@ Time: {now_iso()}
 """
     send_email(subject, body)
 
-    # CRITICAL: this is the response Vapi waits for
-    return jsonify({"results": [{"name": "save_lead", "result": "Lead saved successfully"}]})
+    return "Lead saved successfully"
+
+
+def handle_vapi_tool_calls(payload):
+    """Vapi sends 'tool-calls' events when the AI invokes a function."""
+    message = payload.get("message", {})
+    tool_calls = message.get("toolCalls", [])
+    call = message.get("call", {}) or {}
+    
+    results = []
+    for tc in tool_calls:
+        tool_call_id = tc.get("id", "")
+        function = tc.get("function", {}) or {}
+        name = function.get("name", "")
+        # arguments might be a dict or a JSON string
+        args = function.get("arguments", {}) or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
+        
+        log.info("Tool call: %s args=%s", name, json.dumps(args)[:200])
+        
+        if name == "save_lead":
+            result = save_lead_handler(args, call)
+        else:
+            result = f"Unknown function: {name}"
+        
+        results.append({"toolCallId": tool_call_id, "result": result})
+    
+    return jsonify({"results": results})
 
 
 def handle_vapi_end_of_call_report(payload):
@@ -222,7 +235,6 @@ Company: {company}
 Industry: {industry}
 Call volume: {call_volume}
 Message: {message or '(none)'}
-
 Time: {now_iso()}
 """
     send_email(subject, body)
@@ -239,14 +251,10 @@ def start_timer():
 def log_response(response):
     if hasattr(request, "start_time") and not request.path.startswith(("/static", "/healthz", "/stats")):
         duration = int((time.time() - request.start_time) * 1000)
-        try:
-            payload_summary = json.dumps(request.get_json(silent=True) or {})[:200]
-        except Exception:
-            payload_summary = "?"
-        try:
-            response_summary = response.get_data(as_text=True)[:200]
-        except Exception:
-            response_summary = "?"
+        try: payload_summary = json.dumps(request.get_json(silent=True) or {})[:300]
+        except: payload_summary = "?"
+        try: response_summary = response.get_data(as_text=True)[:300]
+        except: response_summary = "?"
         log_request(request.path, request.method, payload_summary, response_summary, duration, response.status_code)
     return response
 
@@ -263,12 +271,7 @@ def healthz():
 
 @app.route("/stats", methods=["GET"])
 def stats():
-    """Return recent request log for debugging."""
-    return jsonify({
-        "recent_requests": list(request_log),
-        "count": len(request_log),
-        "max": request_log.maxlen
-    })
+    return jsonify({"recent_requests": list(request_log), "count": len(request_log), "max": request_log.maxlen})
 
 
 @app.route("/webhook", methods=["POST", "GET"])
@@ -285,8 +288,19 @@ def webhook():
     message = raw_message if isinstance(raw_message, dict) else {}
     msg_type = message.get("type", "") if isinstance(message, dict) else ""
 
+    # NEW: Vapi sends tool execution as 'tool-calls' (plural)
+    if msg_type == "tool-calls" or message.get("toolCalls"):
+        return handle_vapi_tool_calls(payload)
+
+    # Vapi also sends some events with 'function-call' (singular) for backwards compat
     if message.get("functionCall"):
-        return handle_vapi_function_call(payload)
+        fc = message["functionCall"]
+        params = fc.get("parameters", {}) or {}
+        call = message.get("call", {}) or {}
+        if fc.get("name") == "save_lead":
+            result = save_lead_handler(params, call)
+            return jsonify({"results": [{"name": "save_lead", "result": result}]})
+        return jsonify({"results": [{"name": fc.get("name"), "result": "Unknown function"}]})
 
     if msg_type == "end-of-call-report" or message.get("transcript"):
         return handle_vapi_end_of_call_report(payload)
